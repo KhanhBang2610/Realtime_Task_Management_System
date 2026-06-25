@@ -1,0 +1,685 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Realtime Task Management System - Serverless Backend
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        USERS_TABLE: !Ref UsersTable
+        BOARDS_TABLE: !Ref BoardsTable
+        TASKS_TABLE: !Ref TasksTable
+        ACTIVITY_TABLE: !Ref ActivityLogsTable
+        NOTIFICATIONS_TABLE: !Ref NotificationsTable
+        SNS_TOPIC_ARN: !Ref TaskNotificationsTopic
+
+Resources:
+  # ============================================================
+  # Amazon Cognito - User Pool
+  # ============================================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub taskmanager-users-${Stage}
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: true
+          Mutable: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub taskmanager-client-${Stage}
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # ============================================================
+  # Amazon DynamoDB Tables
+  # ============================================================
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub TaskManager-Users-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  BoardsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub TaskManager-Boards-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: boardId
+          AttributeType: S
+        - AttributeName: ownerId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: boardId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OwnerIndex
+          KeySchema:
+            - AttributeName: ownerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub TaskManager-Tasks-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: boardId
+          AttributeType: S
+        - AttributeName: taskId
+          AttributeType: S
+        - AttributeName: assigneeId
+          AttributeType: S
+        - AttributeName: updatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: boardId
+          KeyType: HASH
+        - AttributeName: taskId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: AssigneeIndex
+          KeySchema:
+            - AttributeName: assigneeId
+              KeyType: HASH
+            - AttributeName: updatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  ActivityLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub TaskManager-ActivityLogs-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: boardId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: boardId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub TaskManager-Notifications-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recipientId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recipientId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ============================================================
+  # Amazon SNS - Notification Topic
+  # ============================================================
+  TaskNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub taskmanager-notifications-${Stage}
+      DisplayName: Task Manager Notifications
+
+  # ============================================================
+  # Amazon S3 - File uploads
+  # ============================================================
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub taskmanager-uploads-${Stage}-${AWS::AccountId}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+
+  # ============================================================
+  # AWS Lambda Functions
+  # ============================================================
+  TaskProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub taskProcessor-${Stage}
+      Handler: index.handler
+      CodeUri: functions/taskProcessor/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TasksTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BoardsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ActivityLogsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+
+  BoardManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub boardManager-${Stage}
+      Handler: index.handler
+      CodeUri: functions/boardManager/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BoardsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ActivityLogsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+
+  UserManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub userManager-${Stage}
+      Handler: index.handler
+      CodeUri: functions/userManager/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+
+  StreamProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub streamProcessor-${Stage}
+      Handler: index.handler
+      CodeUri: functions/streamProcessor/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BoardsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TaskNotificationsTopic.TopicName
+      Events:
+        TasksStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt TasksTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+
+  # ============================================================
+  # AppSync GraphQL API
+  # ============================================================
+  AppSyncApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub TaskManagerAPI-${Stage}
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        UserPoolId: !Ref CognitoUserPool
+        AwsRegion: !Ref AWS::Region
+        DefaultAction: ALLOW
+
+  AppSyncSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      DefinitionS3Location: graphql/schema.graphql
+
+  # --- Data Sources ---
+  TasksTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: TasksTable
+      Type: AMAZON_DYNAMODB
+      DynamoDBConfig:
+        TableName: !Ref TasksTable
+        AwsRegion: !Ref AWS::Region
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  BoardsTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: BoardsTable
+      Type: AMAZON_DYNAMODB
+      DynamoDBConfig:
+        TableName: !Ref BoardsTable
+        AwsRegion: !Ref AWS::Region
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  UsersTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: UsersTable
+      Type: AMAZON_DYNAMODB
+      DynamoDBConfig:
+        TableName: !Ref UsersTable
+        AwsRegion: !Ref AWS::Region
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  ActivityLogsTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: ActivityLogsTable
+      Type: AMAZON_DYNAMODB
+      DynamoDBConfig:
+        TableName: !Ref ActivityLogsTable
+        AwsRegion: !Ref AWS::Region
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  NotificationsTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: NotificationsTable
+      Type: AMAZON_DYNAMODB
+      DynamoDBConfig:
+        TableName: !Ref NotificationsTable
+        AwsRegion: !Ref AWS::Region
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  TaskProcessorDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: TaskProcessorLambda
+      Type: AWS_LAMBDA
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt TaskProcessorFunction.Arn
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  BoardManagerDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: BoardManagerLambda
+      Type: AWS_LAMBDA
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt BoardManagerFunction.Arn
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  UserManagerDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: UserManagerLambda
+      Type: AWS_LAMBDA
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt UserManagerFunction.Arn
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  # ============================================================
+  # IAM Role for AppSync
+  # ============================================================
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub TaskManager-AppSync-Role-${Stage}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppSyncDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !Sub '${UsersTable.Arn}/index/*'
+                  - !GetAtt BoardsTable.Arn
+                  - !Sub '${BoardsTable.Arn}/index/*'
+                  - !GetAtt TasksTable.Arn
+                  - !Sub '${TasksTable.Arn}/index/*'
+                  - !GetAtt ActivityLogsTable.Arn
+                  - !Sub '${ActivityLogsTable.Arn}/index/*'
+                  - !GetAtt NotificationsTable.Arn
+                  - !Sub '${NotificationsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TaskProcessorFunction.Arn
+                  - !GetAtt BoardManagerFunction.Arn
+                  - !GetAtt UserManagerFunction.Arn
+
+
+
+
+  QueryGetmyprofileResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: getMyProfile
+      DataSourceName: !GetAtt UserManagerDataSource.Name
+
+  QueryGetuserbyidResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: getUserById
+      DataSourceName: !GetAtt UserManagerDataSource.Name
+
+  MutationCreateuserprofileResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: createUserProfile
+      DataSourceName: !GetAtt UserManagerDataSource.Name
+
+  MutationUpdateuserprofileResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: updateUserProfile
+      DataSourceName: !GetAtt UserManagerDataSource.Name
+
+  QueryGetboardResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: getBoard
+      DataSourceName: !GetAtt BoardManagerDataSource.Name
+
+  QueryListmyboardsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: listMyBoards
+      DataSourceName: !GetAtt BoardManagerDataSource.Name
+
+  MutationCreateboardResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: createBoard
+      DataSourceName: !GetAtt BoardManagerDataSource.Name
+
+  MutationUpdateboardResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: updateBoard
+      DataSourceName: !GetAtt BoardManagerDataSource.Name
+
+  MutationDeleteboardResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: deleteBoard
+      DataSourceName: !GetAtt BoardManagerDataSource.Name
+
+  MutationInvitememberResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: inviteMember
+      DataSourceName: !GetAtt BoardManagerDataSource.Name
+
+  MutationRemovememberResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: removeMember
+      DataSourceName: !GetAtt BoardManagerDataSource.Name
+
+  MutationRespondtoinviteResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: respondToInvite
+      DataSourceName: !GetAtt BoardManagerDataSource.Name
+
+  QueryGettaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: getTask
+      DataSourceName: !GetAtt TaskProcessorDataSource.Name
+
+  QueryListtasksbyboardResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: listTasksByBoard
+      DataSourceName: !GetAtt TaskProcessorDataSource.Name
+
+  QueryListmyassignedtasksResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: listMyAssignedTasks
+      DataSourceName: !GetAtt TaskProcessorDataSource.Name
+
+  MutationCreatetaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: createTask
+      DataSourceName: !GetAtt TaskProcessorDataSource.Name
+
+  MutationUpdatetaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: updateTask
+      DataSourceName: !GetAtt TaskProcessorDataSource.Name
+
+  MutationMovetaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: moveTask
+      DataSourceName: !GetAtt TaskProcessorDataSource.Name
+
+  MutationDeletetaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: deleteTask
+      DataSourceName: !GetAtt TaskProcessorDataSource.Name
+
+  # --- Notification Resolvers (DynamoDB direct) ---
+  QueryListmynotificationsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: listMyNotifications
+      DataSourceName: !GetAtt NotificationsTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Query",
+          "query": {
+            "expression": "recipientId = :userId",
+            "expressionValues": {
+              ":userId": $util.dynamodb.toDynamoDBJson($ctx.identity.sub)
+            }
+          },
+          "scanIndexForward": false,
+          "limit": $util.defaultIfNull($ctx.args.limit, 20)
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result.items)
+
+  MutationMarknotificationreadResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: markNotificationRead
+      DataSourceName: !GetAtt NotificationsTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "UpdateItem",
+          "key": {
+            "recipientId": $util.dynamodb.toDynamoDBJson($ctx.identity.sub),
+            "timestamp": $util.dynamodb.toDynamoDBJson($ctx.args.timestamp)
+          },
+          "update": {
+            "expression": "SET isRead = :val",
+            "expressionValues": {
+              ":val": { "BOOL": true }
+            }
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # --- Activity Log Resolver (DynamoDB direct) ---
+  QueryListactivitylogsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: listActivityLogs
+      DataSourceName: !GetAtt ActivityTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Query",
+          "query": {
+            "expression": "boardId = :boardId",
+            "expressionValues": {
+              ":boardId": $util.dynamodb.toDynamoDBJson($ctx.args.boardId)
+            }
+          },
+          "scanIndexForward": false,
+          "limit": $util.defaultIfNull($ctx.args.limit, 20)
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result.items)
+
+  # --- DynamoDB Direct DataSources for Notifications & Activity ---
+  ActivityTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: ActivityTable
+      Type: AMAZON_DYNAMODB
+      DynamoDBConfig:
+        TableName: !Ref ActivityLogsTable
+        AwsRegion: !Ref AWS::Region
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+Outputs:
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+  AppSyncApiUrl:
+    Description: AppSync GraphQL Endpoint
+    Value: !GetAtt AppSyncApi.GraphQLUrl
+  AppSyncApiId:
+    Description: AppSync API ID
+    Value: !GetAtt AppSyncApi.ApiId
+  UploadsBucketName:
+    Description: S3 Uploads Bucket
+    Value: !Ref UploadsBucket
+  Region:
+    Description: Deployment Region
+    Value: !Ref AWS::Region

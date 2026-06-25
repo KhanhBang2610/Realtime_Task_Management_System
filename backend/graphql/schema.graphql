@@ -1,0 +1,216 @@
+# ============================================================
+# Types
+# ============================================================
+
+type User {
+  userId: ID!
+  email: String!
+  displayName: String!
+  avatarUrl: String
+  boardIds: [String]
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type Board {
+  boardId: ID!
+  name: String!
+  description: String
+  ownerId: String!
+  ownerName: String!
+  columns: [Column!]!
+  members: [BoardMember!]!
+  backgroundColor: String
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type Column {
+  id: ID!
+  name: String!
+  position: Int!
+}
+
+type BoardMember {
+  userId: String!
+  displayName: String!
+  avatarUrl: String
+  role: MemberRole!
+  joinedAt: AWSDateTime
+}
+
+type Task {
+  taskId: ID!
+  boardId: String!
+  title: String!
+  description: String
+  columnId: String!
+  position: Int!
+  assigneeId: String
+  assigneeName: String
+  createdBy: String!
+  priority: Priority!
+  dueDate: AWSDateTime
+  labels: [String]
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type ActivityLog {
+  logId: ID!
+  boardId: String!
+  action: String!
+  userId: String!
+  userName: String!
+  targetType: String!
+  targetId: String!
+  details: AWSJSON
+  timestamp: AWSDateTime!
+}
+
+type Notification {
+  notificationId: ID!
+  recipientId: String!
+  type: String!
+  boardId: String
+  message: String!
+  isRead: Boolean!
+  timestamp: AWSDateTime!
+}
+
+# ============================================================
+# Enums
+# ============================================================
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+# ============================================================
+# Input Types
+# ============================================================
+
+input CreateBoardInput {
+  name: String!
+  description: String
+  backgroundColor: String
+}
+
+input UpdateBoardInput {
+  boardId: ID!
+  name: String
+  description: String
+  backgroundColor: String
+  columns: [ColumnInput]
+}
+
+input ColumnInput {
+  id: String!
+  name: String!
+  position: Int!
+}
+
+input CreateTaskInput {
+  boardId: ID!
+  title: String!
+  description: String
+  columnId: String!
+  position: Int!
+  assigneeId: String
+  priority: Priority
+  dueDate: AWSDateTime
+  labels: [String]
+}
+
+input UpdateTaskInput {
+  boardId: ID!
+  taskId: ID!
+  title: String
+  description: String
+  assigneeId: String
+  priority: Priority
+  dueDate: AWSDateTime
+  labels: [String]
+}
+
+input MoveTaskInput {
+  boardId: ID!
+  taskId: ID!
+  newColumnId: String!
+  newPosition: Int!
+}
+
+input InviteMemberInput {
+  boardId: ID!
+  email: String!
+  role: MemberRole
+}
+
+# ============================================================
+# Queries
+# ============================================================
+
+type Query {
+  getMyProfile: User
+  getUserById(userId: ID!): User
+  getBoard(boardId: ID!): Board
+  listMyBoards: [Board!]!
+  getTask(boardId: ID!, taskId: ID!): Task
+  listTasksByBoard(boardId: ID!): [Task!]!
+  listMyAssignedTasks: [Task!]!
+  listActivityLogs(boardId: ID!, limit: Int): [ActivityLog!]!
+  listMyNotifications(limit: Int): [Notification!]!
+}
+
+# ============================================================
+# Mutations
+# ============================================================
+
+type Mutation {
+  createUserProfile(displayName: String!, email: String!): User!
+  updateUserProfile(displayName: String, avatarUrl: String): User!
+
+  createBoard(input: CreateBoardInput!): Board!
+  updateBoard(input: UpdateBoardInput!): Board!
+  deleteBoard(boardId: ID!): Board!
+  inviteMember(input: InviteMemberInput!): Board!
+  removeMember(boardId: ID!, userId: ID!): Board!
+
+  createTask(input: CreateTaskInput!): Task!
+  updateTask(input: UpdateTaskInput!): Task!
+  moveTask(input: MoveTaskInput!): Task!
+  deleteTask(boardId: ID!, taskId: ID!): Task!
+
+  markNotificationRead(notificationId: ID!, timestamp: AWSDateTime!): Notification
+  respondToInvite(boardId: ID!, accept: Boolean!): Board
+}
+
+# ============================================================
+# Subscriptions
+# ============================================================
+
+type Subscription {
+  onTaskCreated(boardId: ID!): Task
+    @aws_subscribe(mutations: ["createTask"])
+
+  onTaskUpdated(boardId: ID!): Task
+    @aws_subscribe(mutations: ["updateTask", "moveTask"])
+
+  onTaskDeleted(boardId: ID!): Task
+    @aws_subscribe(mutations: ["deleteTask"])
+
+  onBoardUpdated(boardId: ID!): Board
+    @aws_subscribe(mutations: ["updateBoard", "inviteMember", "removeMember"])
+
+  onNotificationReceived(recipientId: ID!): Notification
+    @aws_subscribe(mutations: ["markNotificationRead"])
+}
