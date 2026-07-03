@@ -8,6 +8,7 @@ import {
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { randomUUID } from 'crypto';
+import { canUserPerform } from '../../utils/permissions.mjs';
 
 const client = new DynamoDBClient({});
 const dynamodb = DynamoDBDocumentClient.from(client);
@@ -21,6 +22,14 @@ const NOTIFICATIONS_TABLE = process.env.NOTIFICATIONS_TABLE;
 export const handler = async (event) => {
   console.log('TaskProcessor event:', JSON.stringify(event, null, 2));
 
+  // Check if this is an HTTP API request (REST) or GraphQL request
+  const isHttpApi = event.httpMethod || event.requestContext?.http?.method;
+  
+  if (isHttpApi) {
+    return await handleHttpRequest(event);
+  }
+
+  // GraphQL handler
   const fieldName = event.info?.fieldName || event.fieldName;
   const args = event.arguments;
   const userId = event.identity?.sub || event.identity?.username;
@@ -61,6 +70,100 @@ export const handler = async (event) => {
     throw error;
   }
 };
+
+/**
+ * HTTP API handler for REST requests
+ * Supports DELETE method with RBAC permission checks
+ */
+async function handleHttpRequest(event) {
+  const httpMethod = event.httpMethod || event.requestContext?.http?.method;
+  
+  try {
+    // Parse user from authorizer context
+    let user;
+    try {
+      user = JSON.parse(event.requestContext?.authorizer?.user || '{}');
+    } catch (parseError) {
+      console.error('Failed to parse user from authorizer:', parseError);
+      return {
+        statusCode: 401,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: 'Unauthorized: Invalid user context' }),
+      };
+    }
+
+    if (httpMethod === 'DELETE') {
+      const boardId = event.pathParameters?.boardId;
+      const taskId = event.pathParameters?.taskId;
+
+      if (!boardId || !taskId) {
+        return {
+          statusCode: 400,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: 'Bad Request: boardId and taskId are required' }),
+        };
+      }
+
+      // Get the task to check ownership
+      const taskResult = await dynamodb.send(new GetCommand({
+        TableName: TASKS_TABLE,
+        Key: { boardId, taskId },
+      }));
+
+      if (!taskResult.Item) {
+        return {
+          statusCode: 404,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: 'Task not found' }),
+        };
+      }
+
+      // Mock task object with ownerId
+      const task = {
+        id: taskId,
+        ownerId: taskResult.Item.createdBy || taskResult.Item.assigneeId
+      };
+
+      // Check permission using canUserPerform
+      if (!canUserPerform(user, 'delete:tasks', task)) {
+        return {
+          statusCode: 403,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: 'Forbidden' }),
+        };
+      }
+
+      // Permission granted, delete the task
+      await dynamodb.send(new DeleteCommand({
+        TableName: TASKS_TABLE,
+        Key: { boardId, taskId },
+      }));
+
+      return {
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          message: 'Task deleted successfully',
+          task: taskResult.Item 
+        }),
+      };
+    }
+
+    return {
+      statusCode: 405,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error: `Method Not Allowed: ${httpMethod}` }),
+    };
+
+  } catch (error) {
+    console.error('Error in HTTP handler:', error);
+    return {
+      statusCode: 500,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error: 'Internal Server Error', message: error.message }),
+    };
+  }
+}
 
 // ─── Helpers ───────────────────────────────────────────────
 
@@ -332,12 +435,48 @@ async function moveTask(input, userId, userName) {
 async function deleteTask(boardId, taskId, userId, userName) {
   const board = await validateBoardMember(boardId, userId);
 
+  // Get the task to check ownership
   const current = await dynamodb.send(new GetCommand({
     TableName: TASKS_TABLE,
     Key: { boardId, taskId },
   }));
-  if (!current.Item) throw new Error('Task not found');
+  
+  if (!current.Item) {
+    throw new Error('Task not found');
+  }
 
+  // Parse user from event context for permission check
+  // In GraphQL context, we need to construct the user object with role
+  // For this implementation, we'll fetch the user's role from the board members
+  const boardMember = board.members?.find(m => m.userId === userId);
+  
+  if (!boardMember) {
+    throw new Error('User is not a member of this board');
+  }
+
+  // Construct user object for permission check
+  const user = {
+    id: userId,
+    role: boardMember.role || 'member',
+    projectIds: [boardId]
+  };
+
+  // Mock task object with ownerId from createdBy field
+  const task = {
+    id: taskId,
+    ownerId: current.Item.createdBy || current.Item.assigneeId // Use createdBy as ownerId
+  };
+
+  // Check if user has permission to delete this task
+  if (!canUserPerform(user, 'delete:tasks', task)) {
+    // Return 403 error for REST API or throw error for GraphQL
+    const error = new Error('Forbidden');
+    error.statusCode = 403;
+    error.message = 'Forbidden: You do not have permission to delete this task';
+    throw error;
+  }
+
+  // If permission check passes, proceed with deletion
   await dynamodb.send(new DeleteCommand({
     TableName: TASKS_TABLE,
     Key: { boardId, taskId },
