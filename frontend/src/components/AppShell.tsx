@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard,
   FolderKanban,
@@ -10,6 +10,7 @@ import {
   X,
   CheckSquare,
 } from 'lucide-react'
+import { useAuth } from '@/context/AuthProvider'
 import { useAuthStore } from '@/store/authStore'
 import { cn } from '@/lib/utils'
 
@@ -93,7 +94,8 @@ function Sidebar({
   open: boolean
   onClose: () => void
 }) {
-  const clearAuth = useAuthStore((s) => s.clearAuth)
+  const { logout } = useAuth()
+  const navigate = useNavigate()
 
   return (
     <>
@@ -159,7 +161,7 @@ function Sidebar({
         <div className="px-3 py-4 border-t border-gray-200 dark:border-gray-800">
           <button
             id="logout-btn"
-            onClick={() => clearAuth()}
+            onClick={() => { logout(); navigate('/login') }}
             className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950 dark:hover:text-red-400 transition-colors"
           >
             <LogOut className="w-5 h-5" />

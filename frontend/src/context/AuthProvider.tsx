@@ -7,19 +7,31 @@ import React, {
 } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useAuthStore } from '@/store/authStore'
-import api from '@/lib/api'
+import {
+  cognitoLogin,
+  cognitoRegister,
+  cognitoRefresh,
+  cognitoLogout,
+} from '@/lib/cognito'
 import type { User } from '@/types'
 
+// ─── Context value shape ──────────────────────────────────────────────────────
 interface AuthContextValue {
   user: User | null
   isLoading: boolean
   isAuthenticated: boolean
+  login: (email: string, password: string) => Promise<void>
+  register: (name: string, email: string, password: string) => Promise<void>
+  logout: () => void
 }
 
 const AuthContext = createContext<AuthContextValue>({
   user: null,
   isLoading: true,
   isAuthenticated: false,
+  login: async () => {},
+  register: async () => {},
+  logout: () => {},
 })
 
 const queryClient = new QueryClient({
@@ -31,32 +43,72 @@ const queryClient = new QueryClient({
   },
 })
 
+// ─── Helper — derive User from Cognito ID token payload ──────────────────────
+function parseUserFromIdToken(idToken: string): User {
+  try {
+    const payload = JSON.parse(atob(idToken.split('.')[1]))
+    return {
+      id: payload.sub as string,
+      name: (payload.name as string) ?? (payload.email as string),
+      email: payload.email as string,
+      role: (payload['custom:role'] as User['role']) ?? 'member',
+      createdAt: new Date(payload.iat * 1000).toISOString(),
+    }
+  } catch {
+    throw new Error('Failed to parse ID token')
+  }
+}
+
+// ─── AuthProvider ─────────────────────────────────────────────────────────────
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const { user, accessToken, setAuth, clearAuth } = useAuthStore()
   const [isLoading, setIsLoading] = useState(true)
 
-  const refreshToken = useCallback(async () => {
+  // On mount — try to restore session from Cognito (uses refresh token in localStorage)
+  const initSession = useCallback(async () => {
     try {
-      const response = await api.post<{ user: User; accessToken: string }>(
-        '/auth/refresh',
-      )
-      setAuth(response.data.user, response.data.accessToken)
+      const session = await cognitoRefresh()
+      if (session) {
+        const parsedUser = parseUserFromIdToken(session.idToken)
+        setAuth(parsedUser, session.accessToken)
+      }
     } catch {
       clearAuth()
+    } finally {
+      setIsLoading(false)
     }
   }, [setAuth, clearAuth])
 
   useEffect(() => {
-    const init = async () => {
-      if (accessToken) {
-        // Token exists — try to refresh to get a fresh one
-        await refreshToken()
-      }
-      setIsLoading(false)
-    }
-
-    void init()
+    void initSession()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── login ────────────────────────────────────────────────────────────────
+  const login = useCallback(
+    async (email: string, password: string) => {
+      const session = await cognitoLogin(email, password)
+      const parsedUser = parseUserFromIdToken(session.idToken)
+      setAuth(parsedUser, session.accessToken)
+    },
+    [setAuth],
+  )
+
+  // ─── register ─────────────────────────────────────────────────────────────
+  const register = useCallback(
+    async (name: string, email: string, password: string) => {
+      const session = await cognitoRegister(name, email, password)
+      const parsedUser = parseUserFromIdToken(session.idToken)
+      setAuth(parsedUser, session.accessToken)
+    },
+    [setAuth],
+  )
+
+  // ─── logout ───────────────────────────────────────────────────────────────
+  const logout = useCallback(() => {
+    cognitoLogout()
+    clearAuth()
+    queryClient.clear()
+  }, [clearAuth])
 
   return (
     <QueryClientProvider client={queryClient}>
@@ -65,6 +117,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           user,
           isLoading,
           isAuthenticated: !!user && !!accessToken,
+          login,
+          register,
+          logout,
         }}
       >
         {children}
